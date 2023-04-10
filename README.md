@@ -24,14 +24,26 @@ dfx canister --help
 
 ## Running the project locally
 
-If you want to test your project locally, you can use the following commands:
-
 ```bash
-# Starts the replica, running in the background
-dfx start --background
+# set up 
+sh -ci "$(curl -fsSL https://internetcomputer.org/install.sh)"
+# you MUST set some password
+dfx identity new dfx_test_key
+rustup target add wasm32-unknown-unknown
 
-# Deploys your canisters to the replica and generates your candid interface
+
+# deploy
+dfx stop
+dfx start --clean --background
 dfx deploy
 ```
 
-Once the job completes, your application will be available at `http://localhost:4943?canisterId={asset_canister_id}`.
+# Test data for the func
+ac74c64A7cFdBb33c33D2827569FE6EaF9a677dB
+100000
+E86C4A45C1Da21f8838a1ea26Fc852BD66489ce9
+5edcd76efb884194fc1f7d348ffc4ef93c611e3ffa89aca3a2dcf0131e2844df
+0
+11155111
+true
+goerli

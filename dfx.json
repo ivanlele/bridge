@@ -4,19 +4,6 @@
       "candid": "src/bridge_core_icp_backend/bridge_core_icp_backend.did",
       "package": "bridge_core_icp_backend",
       "type": "rust"
-    },
-    "bridge_core_icp_frontend": {
-      "dependencies": [
-        "bridge_core_icp_backend"
-      ],
-      "frontend": {
-        "entrypoint": "src/bridge_core_icp_frontend/src/index.html"
-      },
-      "source": [
-        "src/bridge_core_icp_frontend/assets",
-        "dist/bridge_core_icp_frontend/"
-      ],
-      "type": "assets"
     }
   },
   "defaults": {

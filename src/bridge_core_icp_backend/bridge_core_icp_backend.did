@@ -1,3 +1,13 @@
 service : {
-    "greet": (text) -> (text) query;
+    get_erc20_redeem_signature: (
+        token: text,
+        amount: nat,
+        receiver: text,
+        hash: text,
+        nonce: nat,
+        chain_id: nat,
+        is_wrapped: bool,
+        network: text
+    ) -> (vec nat8);
+    eth_address: () -> (text);
 }
