@@ -14,6 +14,7 @@ use ic_web3::Web3;
 use ic_web3::ic::get_eth_addr;
 use ic_web3::signing::{hash_message, keccak256};
 use k256::elliptic_curve::scalar::IsHigh;
+use thiserror::Error;
 
 const KEY_NAME: &str = "dfx_test_key";
 const INPURA_API_KEY: &str = "d009354476b140008dd04c741c00341b";
@@ -40,6 +41,15 @@ impl Network {
             _ => panic!("unavaible network"),
         }
     }
+}
+
+#[derive(Debug, Error)]
+pub enum EncodePackedError {
+    #[error("This token cannot be encoded in packed mode: {0:?}")]
+    InvalidToken(Token),
+
+    #[error("FixedBytes token length > 32")]
+    InvalidBytesLength,
 }
 
 #[ic_cdk_macros::query]
@@ -102,7 +112,7 @@ async fn get_erc20_redeem_signature(
     let chain_id = Uint::from_dec_str(&nat_to_normal_str(&chain_id))
         .expect("failed to parse chain_id");
 
-    let data = Token::Tuple(vec![
+    let data = vec![
         Token::Address(token_address),
         Token::Uint(amount),
         Token::Address(receiver),
@@ -110,19 +120,16 @@ async fn get_erc20_redeem_signature(
         Token::Uint(nonce),
         Token::Uint(chain_id),
         Token::Bool(is_wrapped)
-    ]);
+    ];
     
-    let encoded_data = ethabi::encode(&[data]);
-    
-    ic_cdk::println!("Raw msg: {}", hex::encode(&encoded_data));
+    let encoded_data = encode_packed(&data)
+        .expect("failed to encode data");
 
     let hashed_data = keccak256(&encoded_data);
 
     let msg_hash = hash_message(&hashed_data).as_bytes().to_vec();
 
     let derivation_path = vec![ic_cdk::id().as_slice().to_vec()];
-    
-    ic_cdk::println!("Message hash: {}", hex::encode(&msg_hash));
 
     let call_args = SignWithEcdsaArgument {
         message_hash: msg_hash.clone(),
@@ -143,7 +150,7 @@ async fn get_erc20_redeem_signature(
     let k256_signature = Signature::from_bytes(GenericArray::from_slice(&signature))
         .expect("failed to convert a byte array to a k256 signature");
 
-    let v: u8 = if bool::from(k256_signature.s().is_high()) { 28 } else { 27 };
+    let v: u8 = if !bool::from(k256_signature.s().is_high()) { 28 } else { 27 };
 
     signature.push(v);
 
@@ -154,6 +161,90 @@ fn nat_to_normal_str(nat: &Nat) -> String {
     nat.to_string().chars().filter(|&c| c != '_').collect()
 }
 
+fn encode_packed(tokens: &[Token]) -> Result<Vec<u8>, EncodePackedError> {
+    let mut max = 0;
+    for token in tokens {
+        check(token)?;
+        max += max_encoded_length(token);
+    }
+
+    let mut bytes = Vec::with_capacity(max);
+    for token in tokens {
+        encode_token(token, &mut bytes, false);
+    }
+    Ok(bytes)
+}
+
+fn max_encoded_length(token: &Token) -> usize {
+    match token {
+        Token::Int(_) | Token::Uint(_) | Token::FixedBytes(_) => 32,
+        Token::Address(_) => 20,
+        Token::Bool(_) => 1,
+        Token::Array(vec) | Token::FixedArray(vec) | Token::Tuple(vec) => {
+            vec.iter().map(|token| max_encoded_length(token).max(32)).sum()
+        }
+        Token::Bytes(b) => b.len(),
+        Token::String(s) => s.len(),
+    }
+}
+
+fn check(token: &Token) -> Result<(), EncodePackedError> {
+    match token {
+        Token::FixedBytes(vec) if vec.len() > 32 => Err(EncodePackedError::InvalidBytesLength),
+
+        Token::Tuple(_) => Err(EncodePackedError::InvalidToken(token.clone())),
+        Token::Array(vec) | Token::FixedArray(vec) => {
+            for t in vec.iter() {
+                if t.is_dynamic() || matches!(t, Token::Array(_)) {
+                    return Err(EncodePackedError::InvalidToken(token.clone()))
+                }
+                check(t)?;
+            }
+            Ok(())
+        }
+
+        _ => Ok(()),
+    }
+}
+
+fn encode_token(token: &Token, out: &mut Vec<u8>, in_array: bool) {
+    match token {
+        Token::Address(addr) => {
+            if in_array {
+                out.extend_from_slice(&[0; 12]);
+            }
+            out.extend_from_slice(&addr.0)
+        }
+        Token::Int(n) | Token::Uint(n) => {
+            let mut buf = [0; 32];
+            n.to_big_endian(&mut buf);
+            out.extend_from_slice(&buf);
+        }
+        Token::Bool(b) => {
+            if in_array {
+                out.extend_from_slice(&[0; 31]);
+            }
+            out.push((*b) as u8);
+        }
+        Token::FixedBytes(bytes) => {
+            out.extend_from_slice(bytes);
+            if in_array {
+                let mut remaining = vec![0; 32 - bytes.len()];
+                out.append(&mut remaining);
+            }
+        }
+
+        Token::Bytes(bytes) => out.extend_from_slice(bytes),
+        Token::String(s) => out.extend_from_slice(s.as_bytes()),
+        Token::Array(vec) | Token::FixedArray(vec) => {
+            for token in vec {
+                encode_token(token, out, true);
+            }
+        }
+
+        token => unreachable!("Uncaught invalid token: {token:?}"),
+    }
+}
 #[cfg(test)]
 mod tests {
     use ethabi::{Token, Address, Uint};
@@ -161,19 +252,9 @@ mod tests {
     use generic_array::GenericArray;
     use k256::ecdsa::Signature;
     use k256::elliptic_curve::scalar::IsHigh;
-
     use secp256k1::{Secp256k1, Message, SecretKey, PublicKey};
-    use Token::*;
-    use thiserror::Error;
 
-    #[derive(Debug, Error)]
-    pub enum EncodePackedError {
-        #[error("This token cannot be encoded in packed mode: {0:?}")]
-        InvalidToken(Token),
-
-        #[error("FixedBytes token length > 32")]
-        InvalidBytesLength,
-    }
+    use crate::encode_packed;
 
     const ECDSA_HEX_PRIVATE_KEY: &[u8] = "63dd6406ece1e459644301db883394a238ba4f1a2ff54249da7551f20bc2f8a9".as_bytes();
 
@@ -244,7 +325,7 @@ mod tests {
         let k256_signature = Signature::from_bytes(GenericArray::from_slice(&signature))
             .expect("failed to convert a byte array to a k256 signature");
 
-        let v: u8 = if bool::from(k256_signature.s().is_high()) { 28 } else { 27 };
+        let v: u8 = if !bool::from(k256_signature.s().is_high()) { 28 } else { 27 };
 
         signature.push(v);
         
@@ -253,90 +334,5 @@ mod tests {
         let public_key = PublicKey::from_secret_key(&secp, &secret_key);
         
         assert!(secp.verify_ecdsa(&msg, &sig, &public_key).is_ok());
-    }
-
-    pub fn encode_packed(tokens: &[Token]) -> Result<Vec<u8>, EncodePackedError> {
-        let mut max = 0;
-        for token in tokens {
-            check(token)?;
-            max += max_encoded_length(token);
-        }
-    
-        let mut bytes = Vec::with_capacity(max);
-        for token in tokens {
-            encode_token(token, &mut bytes, false);
-        }
-        Ok(bytes)
-    }
-
-    fn max_encoded_length(token: &Token) -> usize {
-        match token {
-            Int(_) | Uint(_) | FixedBytes(_) => 32,
-            Address(_) => 20,
-            Bool(_) => 1,
-            Array(vec) | FixedArray(vec) | Tuple(vec) => {
-                vec.iter().map(|token| max_encoded_length(token).max(32)).sum()
-            }
-            Bytes(b) => b.len(),
-            String(s) => s.len(),
-        }
-    }
-
-    fn check(token: &Token) -> Result<(), EncodePackedError> {
-        match token {
-            FixedBytes(vec) if vec.len() > 32 => Err(EncodePackedError::InvalidBytesLength),
-    
-            Tuple(_) => Err(EncodePackedError::InvalidToken(token.clone())),
-            Array(vec) | FixedArray(vec) => {
-                for t in vec.iter() {
-                    if t.is_dynamic() || matches!(t, Array(_)) {
-                        return Err(EncodePackedError::InvalidToken(token.clone()))
-                    }
-                    check(t)?;
-                }
-                Ok(())
-            }
-    
-            _ => Ok(()),
-        }
-    }
-
-    fn encode_token(token: &Token, out: &mut Vec<u8>, in_array: bool) {
-        match token {
-            Address(addr) => {
-                if in_array {
-                    out.extend_from_slice(&[0; 12]);
-                }
-                out.extend_from_slice(&addr.0)
-            }
-            Int(n) | Uint(n) => {
-                let mut buf = [0; 32];
-                n.to_big_endian(&mut buf);
-                out.extend_from_slice(&buf);
-            }
-            Bool(b) => {
-                if in_array {
-                    out.extend_from_slice(&[0; 31]);
-                }
-                out.push((*b) as u8);
-            }
-            FixedBytes(bytes) => {
-                out.extend_from_slice(bytes);
-                if in_array {
-                    let mut remaining = vec![0; 32 - bytes.len()];
-                    out.append(&mut remaining);
-                }
-            }
-    
-            Bytes(bytes) => out.extend_from_slice(bytes),
-            String(s) => out.extend_from_slice(s.as_bytes()),
-            Array(vec) | FixedArray(vec) => {
-                for token in vec {
-                    encode_token(token, out, true);
-                }
-            }
-    
-            token => unreachable!("Uncaught invalid token: {token:?}"),
-        }
-    }
+    }    
 }
