@@ -3,7 +3,8 @@ use ic_cdk::api::management_canister::ecdsa::{
     sign_with_ecdsa, SignWithEcdsaArgument, EcdsaKeyId, EcdsaCurve
 };
 use ic_web3::types::H256;
-// use generic_array::GenericArray;
+use generic_array::GenericArray;
+use k256::ecdsa::Signature;
 use ic_cdk::api::management_canister::http_request::{
     HttpResponse, TransformArgs,
 };
@@ -12,9 +13,7 @@ use ic_web3::transports::ICHttp;
 use ic_web3::Web3;
 use ic_web3::ic::get_eth_addr;
 use ic_web3::signing::{hash_message, keccak256};
-// use k256::ecdsa::Signature;
-// use k256::elliptic_curve::scalar::IsHigh;
-// use secp256k1::{Secp256k1, Message, ecdsa, PublicKey};
+use k256::elliptic_curve::scalar::IsHigh;
 
 const KEY_NAME: &str = "dfx_test_key";
 const INPURA_API_KEY: &str = "d009354476b140008dd04c741c00341b";
@@ -68,9 +67,6 @@ async fn get_erc20_redeem_signature(
     is_wrapped: bool,
     network: String
 ) -> Vec<u8> {
-    let decode_hash = hex::decode(hash)
-        .expect("failed to decode hash");
-
     let node_url = format!(
         "https://{}.infura.io/v3/{}",
         Network::from(&network).as_str(),
@@ -81,8 +77,11 @@ async fn get_erc20_redeem_signature(
         ICHttp::new(&node_url, None, None).unwrap()
     );
 
+    let decoded_hash = hex::decode(hash)
+        .expect("failed to decode hash");
+
     let tx_receipt = w3.eth()
-        .transaction_receipt(H256::from_slice(&decode_hash))
+        .transaction_receipt(H256::from_slice(&decoded_hash))
         .await
         .expect("failed to get a tx receipt")
         .ok_or_else(|| panic!("tx doesn't exist or wasn't indexed yet"))
@@ -107,22 +106,26 @@ async fn get_erc20_redeem_signature(
         Token::Address(token_address),
         Token::Uint(amount),
         Token::Address(receiver),
-        Token::FixedBytes(decode_hash.clone()),
+        Token::FixedBytes(decoded_hash.clone()),
         Token::Uint(nonce),
         Token::Uint(chain_id),
         Token::Bool(is_wrapped)
     ]);
     
     let encoded_data = ethabi::encode(&[data]);
+    
+    ic_cdk::println!("Raw msg: {}", hex::encode(&encoded_data));
 
     let hashed_data = keccak256(&encoded_data);
 
-    let message_hash = hash_message(&hashed_data).as_bytes().to_vec();
+    let msg_hash = hash_message(&hashed_data).as_bytes().to_vec();
 
     let derivation_path = vec![ic_cdk::id().as_slice().to_vec()];
+    
+    ic_cdk::println!("Message hash: {}", hex::encode(&msg_hash));
 
     let call_args = SignWithEcdsaArgument {
-        message_hash: message_hash.clone(),
+        message_hash: msg_hash.clone(),
         derivation_path,
         key_id: EcdsaKeyId {
             curve: EcdsaCurve::Secp256k1,
@@ -130,40 +133,19 @@ async fn get_erc20_redeem_signature(
         }
     };
     
-    let signature = match sign_with_ecdsa(call_args).await {
+    let mut signature = match sign_with_ecdsa(call_args).await {
         Ok((response,)) => response.signature,
         Err((rejection_code, msg)) => {
             panic!("failed to sign a hash. Rejection code: {:?}, msg: {:?}", rejection_code, msg);
         }
     };
 
-    // let k256_signature = Signature::from_bytes(GenericArray::from_slice(&signature))
-    //     .expect("failed to convert a byte array to a k256 signature");
+    let k256_signature = Signature::from_bytes(GenericArray::from_slice(&signature))
+        .expect("failed to convert a byte array to a k256 signature");
 
-    ic_cdk::println!("Signature: {}", hex::encode(&signature));
+    let v: u8 = if bool::from(k256_signature.s().is_high()) { 28 } else { 27 };
 
-    let eth_addr = eth_address().await;
-
-    ic_cdk::println!("Eth addr: {}", eth_addr);
-
-    // let secp = Secp256k1::verification_only();
-
-    ic_cdk::println!("msg: {}", hex::encode(&message_hash));
-
-    // let msg = Message::from_slice(&message_hash).unwrap();
-
-    // let sig = ecdsa::Signature::from_compact(&signature).unwrap();
-
-    // let pk = PublicKey::from_slice(eth_addr.as_bytes()).unwrap();
-
-    // match secp.verify_ecdsa(&msg, &sig, &pk) {
-    //     Ok(_) => ic_cdk::println!("Signature verified"),
-    //     Err(err) => ic_cdk::println!("Signature unverified, err: {:?}", err)
-    // };
-
-    // let v: u8 = if bool::from(k256_signature.s().is_high()) { 28 } else { 27 };
-
-    // signature.push(v);
+    signature.push(v);
 
     signature
 }
@@ -172,25 +154,189 @@ fn nat_to_normal_str(nat: &Nat) -> String {
     nat.to_string().chars().filter(|&c| c != '_').collect()
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use crate::get_erc20_redeem_signature;
-//     use candid::Nat;
+#[cfg(test)]
+mod tests {
+    use ethabi::{Token, Address, Uint};
+    use ic_web3::signing::{keccak256, hash_message};
+    use generic_array::GenericArray;
+    use k256::ecdsa::Signature;
+    use k256::elliptic_curve::scalar::IsHigh;
 
+    use secp256k1::{Secp256k1, Message, SecretKey, PublicKey};
+    use Token::*;
+    use thiserror::Error;
 
-//     #[tokio::test]
-//     async fn it_works() {
-//         let result = get_erc20_redeem_signature(
-//             String::from("ac74c64A7cFdBb33c33D2827569FE6EaF9a677dB"),
-//             Nat::from(100000),
-//             String::from("E86C4A45C1Da21f8838a1ea26Fc852BD66489ce9"),
-//             String::from("5edcd76efb884194fc1f7d348ffc4ef93c611e3ffa89aca3a2dcf0131e2844df"),
-//             Nat::from(0),
-//             Nat::from(11155111),
-//             true,
-//             String::from("goerli"),
-//         ).await;
+    #[derive(Debug, Error)]
+    pub enum EncodePackedError {
+        #[error("This token cannot be encoded in packed mode: {0:?}")]
+        InvalidToken(Token),
 
-//         println!("Output Signature: {:?}", hex::encode(&result));
-//     }
-// }
+        #[error("FixedBytes token length > 32")]
+        InvalidBytesLength,
+    }
+
+    const ECDSA_HEX_PRIVATE_KEY: &[u8] = "63dd6406ece1e459644301db883394a238ba4f1a2ff54249da7551f20bc2f8a9".as_bytes();
+
+    lazy_static::lazy_static! {
+        static ref TOKEN_ADDRESS: Address = Address::from_slice(&hex::decode("ac74c64A7cFdBb33c33D2827569FE6EaF9a677dB").unwrap());
+        static ref AMOUNT: Uint = Uint::from(100000);
+        static ref RECEIVER: Address = Address::from_slice(&hex::decode("E86C4A45C1Da21f8838a1ea26Fc852BD66489ce9").unwrap());
+        static ref NONCE: Uint = Uint::from(0);
+        static ref CHAID_ID: Uint = Uint::from(11155111);
+        static ref TX_HASH: Vec<u8> = hex::decode("5edcd76efb884194fc1f7d348ffc4ef93c611e3ffa89aca3a2dcf0131e2844df").unwrap();
+    }
+
+    #[test]
+    fn hash() {
+        let data = Token::Tuple(vec![
+            Token::Address(*TOKEN_ADDRESS),
+            Token::Uint(*AMOUNT),
+            Token::Address(*RECEIVER),
+            Token::FixedBytes((*TX_HASH.clone()).to_vec()),
+            Token::Uint(*NONCE),
+            Token::Uint(*CHAID_ID),
+            Token::Bool(true)
+        ]);
+        
+        let encoded_data = ethabi::encode(&[data]);
+        println!("Encoded data: {}", hex::encode(&encoded_data));
+        
+        let hashed_data = keccak256(&encoded_data);
+        println!("Hashed data: {}", hex::encode(&hashed_data));
+    }
+
+    #[test]
+    fn sign() {
+        let data = vec![
+            Token::Address(*TOKEN_ADDRESS),
+            Token::Uint(*AMOUNT),
+            Token::Address(*RECEIVER),
+            Token::FixedBytes((*TX_HASH.clone()).to_vec()),
+            Token::Uint(*NONCE),
+            Token::Uint(*CHAID_ID),
+            Token::Bool(true)
+        ];
+        
+        let encoded_data = encode_packed(&data).unwrap();
+
+        println!("Encoded data: {}", hex::encode(&encoded_data));
+
+        let hashed_data = keccak256(&encoded_data);
+
+        println!("Hashed data: {}", hex::encode(&hashed_data));
+
+        let secret_key = SecretKey::from_slice(&hex::decode(ECDSA_HEX_PRIVATE_KEY).unwrap()).unwrap();
+
+        let secp = Secp256k1::new();
+        
+        let hashed_data = hash_message(&hashed_data);
+        let eth_data = hashed_data.as_bytes();
+
+        let msg = Message::from_slice(eth_data)
+            .expect("32 bytes");
+        
+        println!("Msg: {}", hex::encode(eth_data));
+
+        let sig = secp.sign_ecdsa(&msg, &secret_key);
+
+        let mut signature = sig.serialize_compact().to_vec();
+
+        let k256_signature = Signature::from_bytes(GenericArray::from_slice(&signature))
+            .expect("failed to convert a byte array to a k256 signature");
+
+        let v: u8 = if bool::from(k256_signature.s().is_high()) { 28 } else { 27 };
+
+        signature.push(v);
+        
+        println!("Signature: {}", hex::encode(&signature));
+
+        let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+        
+        assert!(secp.verify_ecdsa(&msg, &sig, &public_key).is_ok());
+    }
+
+    pub fn encode_packed(tokens: &[Token]) -> Result<Vec<u8>, EncodePackedError> {
+        let mut max = 0;
+        for token in tokens {
+            check(token)?;
+            max += max_encoded_length(token);
+        }
+    
+        let mut bytes = Vec::with_capacity(max);
+        for token in tokens {
+            encode_token(token, &mut bytes, false);
+        }
+        Ok(bytes)
+    }
+
+    fn max_encoded_length(token: &Token) -> usize {
+        match token {
+            Int(_) | Uint(_) | FixedBytes(_) => 32,
+            Address(_) => 20,
+            Bool(_) => 1,
+            Array(vec) | FixedArray(vec) | Tuple(vec) => {
+                vec.iter().map(|token| max_encoded_length(token).max(32)).sum()
+            }
+            Bytes(b) => b.len(),
+            String(s) => s.len(),
+        }
+    }
+
+    fn check(token: &Token) -> Result<(), EncodePackedError> {
+        match token {
+            FixedBytes(vec) if vec.len() > 32 => Err(EncodePackedError::InvalidBytesLength),
+    
+            Tuple(_) => Err(EncodePackedError::InvalidToken(token.clone())),
+            Array(vec) | FixedArray(vec) => {
+                for t in vec.iter() {
+                    if t.is_dynamic() || matches!(t, Array(_)) {
+                        return Err(EncodePackedError::InvalidToken(token.clone()))
+                    }
+                    check(t)?;
+                }
+                Ok(())
+            }
+    
+            _ => Ok(()),
+        }
+    }
+
+    fn encode_token(token: &Token, out: &mut Vec<u8>, in_array: bool) {
+        match token {
+            Address(addr) => {
+                if in_array {
+                    out.extend_from_slice(&[0; 12]);
+                }
+                out.extend_from_slice(&addr.0)
+            }
+            Int(n) | Uint(n) => {
+                let mut buf = [0; 32];
+                n.to_big_endian(&mut buf);
+                out.extend_from_slice(&buf);
+            }
+            Bool(b) => {
+                if in_array {
+                    out.extend_from_slice(&[0; 31]);
+                }
+                out.push((*b) as u8);
+            }
+            FixedBytes(bytes) => {
+                out.extend_from_slice(bytes);
+                if in_array {
+                    let mut remaining = vec![0; 32 - bytes.len()];
+                    out.append(&mut remaining);
+                }
+            }
+    
+            Bytes(bytes) => out.extend_from_slice(bytes),
+            String(s) => out.extend_from_slice(s.as_bytes()),
+            Array(vec) | FixedArray(vec) => {
+                for token in vec {
+                    encode_token(token, out, true);
+                }
+            }
+    
+            token => unreachable!("Uncaught invalid token: {token:?}"),
+        }
+    }
+}
