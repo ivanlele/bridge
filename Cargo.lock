@@ -154,7 +154,6 @@ version = "0.1.0"
 dependencies = [
  "candid",
  "ethabi 18.0.0",
- "generic-array",
  "hex",
  "ic-cdk",
  "ic-cdk-macros",

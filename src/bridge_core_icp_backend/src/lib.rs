@@ -3,8 +3,6 @@ use ic_cdk::api::management_canister::ecdsa::{
     sign_with_ecdsa, SignWithEcdsaArgument, EcdsaKeyId, EcdsaCurve
 };
 use ic_web3::types::H256;
-use generic_array::GenericArray;
-use k256::ecdsa::Signature;
 use ic_cdk::api::management_canister::http_request::{
     HttpResponse, TransformArgs,
 };
@@ -12,12 +10,17 @@ use ethabi::{Token, Address, Uint};
 use ic_web3::transports::ICHttp;
 use ic_web3::Web3;
 use ic_web3::ic::get_eth_addr;
+use ic_web3::types::H160;
 use ic_web3::signing::{hash_message, keccak256};
-use k256::elliptic_curve::scalar::IsHigh;
 use thiserror::Error;
+use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+use secp256k1::{PublicKey, Secp256k1};
 
 const KEY_NAME: &str = "dfx_test_key";
 const INPURA_API_KEY: &str = "d009354476b140008dd04c741c00341b";
+
+type Result<T, E> = std::result::Result<T, E>;
+
 enum Network {
     MainNet,
     Goerli,
@@ -58,12 +61,11 @@ fn transform(response: TransformArgs) -> HttpResponse {
 }
 
 #[ic_cdk_macros::update]
-async fn eth_address() -> String {
-    hex::encode(
-        get_eth_addr(None, None, KEY_NAME.to_string())
-            .await
-            .expect("failed to get an ethereum address")
-    )
+async fn eth_address() -> Result<String, String> {
+    match get_eth_addr(None, None, KEY_NAME.to_string()).await {
+        Ok(eth_addr) => Ok(hex::encode(eth_addr)),
+        Err(err) => Err(err)
+    }
 }
 
 #[ic_cdk_macros::update]
@@ -71,12 +73,12 @@ async fn get_erc20_redeem_signature(
     token_address: String,
     amount: Nat,
     receiver: String,
-    hash: String,
+    tx_hash: String,
     nonce: Nat,
     chain_id: Nat,
     is_wrapped: bool,
     network: String
-) -> Vec<u8> {
+) -> Result<String, String> {
     let node_url = format!(
         "https://{}.infura.io/v3/{}",
         Network::from(&network).as_str(),
@@ -87,30 +89,29 @@ async fn get_erc20_redeem_signature(
         ICHttp::new(&node_url, None, None).unwrap()
     );
 
-    let decoded_hash = hex::decode(hash)
-        .expect("failed to decode hash");
+    let decoded_hash = hex::decode(tx_hash)
+        .map_err(|err| format!("failed to decode the tx hash: {}", err))?;
 
     let tx_receipt = w3.eth()
         .transaction_receipt(H256::from_slice(&decoded_hash))
         .await
-        .expect("failed to get a tx receipt")
-        .ok_or_else(|| panic!("tx doesn't exist or wasn't indexed yet"))
-        .expect("something mysterious has happened");
+        .map_err(|err| format!("failed to get a tx receipt: {}", err))?
+        .ok_or_else(|| return "the tx doesn't exist or wasn't indexed yet".to_string())?;
 
     if tx_receipt.status.unwrap_or_default().is_zero() {
-        panic!("tx has failed");
+        return Err("The tx has failed".to_string());
     }
 
     let token_address = Address::from_slice(&hex::decode(&token_address)
-        .expect("failed to decode token address"));
+        .map_err(|err| format!("failed to decode the token address: {}", err))?);
     let amount = Uint::from_dec_str(&nat_to_normal_str(&amount))
-        .expect("failed to parse amount");
+        .map_err(|err| format!("failed to decode the amount: {}", err))?;
     let receiver = Address::from_slice(&hex::decode(&receiver)
-        .expect("failed to decode receiver"));
+        .map_err(|err| format!("failed to decode the receiver: {}", err))?);
     let nonce = Uint::from_dec_str(&nat_to_normal_str(&nonce))
-        .expect("failed to parse nonce");
+        .map_err(|err| format!("failed to decode the nonce: {}", err))?;
     let chain_id = Uint::from_dec_str(&nat_to_normal_str(&chain_id))
-        .expect("failed to parse chain_id");
+        .map_err(|err| format!("failed to decode the chain id: {}", err))?;
 
     let data = vec![
         Token::Address(token_address),
@@ -123,7 +124,7 @@ async fn get_erc20_redeem_signature(
     ];
     
     let encoded_data = encode_packed(&data)
-        .expect("failed to encode data");
+        .map_err(|err| format!("failed to perform a packing encoding: {}", err))?;
 
     let hashed_data = keccak256(&encoded_data);
 
@@ -143,18 +144,49 @@ async fn get_erc20_redeem_signature(
     let mut signature = match sign_with_ecdsa(call_args).await {
         Ok((response,)) => response.signature,
         Err((rejection_code, msg)) => {
-            panic!("failed to sign a hash. Rejection code: {:?}, msg: {:?}", rejection_code, msg);
+            return Err(format!("failed to sign a hash. Rejection code: {:?}, msg: {:?}", rejection_code, msg));
         }
     };
 
-    let k256_signature = Signature::from_bytes(GenericArray::from_slice(&signature))
-        .expect("failed to convert a byte array to a k256 signature");
+    let public_key = get_eth_addr(None, None, KEY_NAME.to_string())
+        .await
+        .map_err(|err| format!("failed to get an eth address: {}", err))?;
 
-    let v: u8 = if !bool::from(k256_signature.s().is_high()) { 28 } else { 27 };
+    let v: u8 = get_eth_v(&signature, &msg_hash, &public_key)
+        .map_err(|err| format!("failed to get a v: {}", err))?;
 
     signature.push(v);
 
-    signature
+    Ok(format!("0x{}", hex::encode(signature)))
+}
+
+fn get_eth_v(signature: &[u8], msg: &[u8], public_key: &H160) -> Result<u8, String> {
+    let sig = Signature::from_slice(&signature)
+        .map_err(|err| format!("failed to decode a signature: {}", err))?;
+
+    let recovery_id = RecoveryId::from_byte(0).unwrap();
+
+    let recovered_key = VerifyingKey::recover_from_msg(msg, &sig, recovery_id)
+        .map_err(|err| format!("failed to recover a key: {}", err))?;
+
+    ic_cdk::println!("First pk {}", hex::encode(keccak256(&recovered_key.to_sec1_bytes())));
+
+    if keccak256(&recovered_key.to_sec1_bytes()) == public_key.as_bytes() {
+        return Ok(27);
+    }
+
+    let recovery_id = RecoveryId::from_byte(1).unwrap();
+
+    let recovered_key = VerifyingKey::recover_from_msg(msg, &sig, recovery_id)
+        .map_err(|err| format!("failed to recover a key: {}", err))?;
+
+        ic_cdk::println!("Second pk {}", hex::encode(keccak256(&recovered_key.to_sec1_bytes())));
+
+    if keccak256(&recovered_key.to_sec1_bytes()) == public_key.as_bytes() {
+        return Ok(28);
+    }
+
+    Err("failed to get a v".to_string())
 }
 
 fn nat_to_normal_str(nat: &Nat) -> String {
@@ -249,9 +281,6 @@ fn encode_token(token: &Token, out: &mut Vec<u8>, in_array: bool) {
 mod tests {
     use ethabi::{Token, Address, Uint};
     use ic_web3::signing::{keccak256, hash_message};
-    use generic_array::GenericArray;
-    use k256::ecdsa::Signature;
-    use k256::elliptic_curve::scalar::IsHigh;
     use secp256k1::{Secp256k1, Message, SecretKey, PublicKey};
 
     use crate::encode_packed;
@@ -322,12 +351,7 @@ mod tests {
 
         let mut signature = sig.serialize_compact().to_vec();
 
-        let k256_signature = Signature::from_bytes(GenericArray::from_slice(&signature))
-            .expect("failed to convert a byte array to a k256 signature");
-
-        let v: u8 = if !bool::from(k256_signature.s().is_high()) { 28 } else { 27 };
-
-        signature.push(v);
+        signature.push(28);
         
         println!("Signature: {}", hex::encode(&signature));
 
